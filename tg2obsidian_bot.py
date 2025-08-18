@@ -1,6 +1,6 @@
 # tg2obsidian_bot - pulls posts from your private Telegram group
 # and puts them in daily inbox note in your Obsidian vault
-# Copyright (c) 2023-2025, Dmitry Ulanov
+# Copyright (c) 2023-2024, Dmitry Ulanov
 # https://github.com/dimonier/tg2obsidian
 
 import os
@@ -13,19 +13,19 @@ import aiofiles
 import warnings
 
 from pathlib import Path
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta
 from bs4 import BeautifulSoup
 from pytz import timezone
 import urllib.request
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Filter, Command
 from aiogram.types import ContentType, File, Message, MessageEntity, Poll, PollAnswer
 from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
 from aiogram.enums import ParseMode
 from aiogram.methods.set_message_reaction import SetMessageReaction
 from aiogram.utils.text_decorations import html_decoration
-from database import set_notes_folder, get_notes_folder
+from database import set_notes_folder, get_notes_folder, get_all_as_tasks, set_all_as_tasks
 from aiogram.client.default import DefaultBotProperties
 
 import config
@@ -55,6 +55,11 @@ class CommonMiddleware(BaseMiddleware):
 
             notes_folder = get_notes_folder(message.chat.id)
             note = note_from_message(message, notes_folder)
+            # read forced task flag for this chat
+            try:
+                note.all_as_tasks = get_all_as_tasks(message.chat.id)
+            except Exception:
+                note.all_as_tasks = False
             data["note"] = note
         try:
             result = await handler(event, data)
@@ -73,15 +78,36 @@ class CommonMiddleware(BaseMiddleware):
 bot = Bot(token=config.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 # router = Router()
 dp = Dispatcher()
+dp.update.middleware(CommonMiddleware())  # Регистрация middleware
+
+
+async def _set_bot_commands(bot: Bot) -> None:
+    """Register bot commands in Telegram UI on startup."""
+    commands = [
+        types.BotCommand(command="start", description="Start bot"),
+        types.BotCommand(command="help", description="Show help"),
+        types.BotCommand(command="set_folder", description="Set custom notes folder"),
+        types.BotCommand(command="tasks", description="Force all posts as tasks (on/off)"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+async def _on_startup(bot: Bot) -> None:
+    await _set_bot_commands(bot)
+
+
+dp.startup.register(_on_startup)
+
 
 class Note:
-    def __init__(self,
-                 text = "",
-                 date = dt.now().strftime('%Y-%m-%d'),
-                 time = dt.now().strftime('%H:%M:%S')):
-        self.text = text
+    """Class to represent a note with its metadata"""
+    def __init__(self, date: str, time: str, notes_folder: str, message: Message | None = None, all_as_tasks: bool = False):
         self.date = date
         self.time = time
+        self.notes_folder = notes_folder
+        self.message = message
+        self.text = ""
+        self.all_as_tasks = all_as_tasks
 
 basic_log = False
 debug_log = False
@@ -93,8 +119,19 @@ if 'log_level' in dir(config) and config.log_level >= 1:
     logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO, filename = 'bot.log', encoding = 'UTF-8', datefmt = '%Y-%m-%d %H:%M:%S')
     log = logging.getLogger()
 
+if config.ocr:
+    import pytesseract
+    from PIL import Image
+
+    if config.ocr_languages:
+        ocr_languages = config.ocr_languages
+    else:
+        ocr_languages = 'eng'
+    print(f'Prepared for OCR in {ocr_languages}')
+
 if config.recognize_voice:
     import torch
+    import whisper
     import gc
 
     whisper_device = getattr(config, 'whisper_device', 'cpu')
@@ -114,28 +151,28 @@ if config.recognize_voice:
 def should_add_timestamp(message: Message) -> bool:
     """
     Check if we should add timestamp for the message based on time difference with previous message.
-
+    
     Args:
         message (Message): Current message
-
+        
     Returns:
         bool: True if timestamp should be added, False otherwise
     """
     chat_id = message.chat.id
     current_time = message.date
-
+    
     if chat_id not in last_message_times:
         last_message_times[chat_id] = current_time
         return True
-
+        
     time_diff = (current_time - last_message_times[chat_id]).total_seconds()
     last_message_times[chat_id] = current_time
-
+    
     return time_diff >= config.message_timestamp_interval
 
 # Handlers
 @dp.message(Command("start"))
-async def send_welcome(message: types.Message):
+async def command_start(message: types.Message):
     log_basic(
         f"Starting chat with the user @{message.from_user.username} ({message.from_user.first_name} {message.from_user.last_name}, user_id = {message.from_user.id}), chat_id = {message.chat.id} ({message.chat.title})"
     )
@@ -146,7 +183,7 @@ async def send_welcome(message: types.Message):
 async def command_set_folder(message: types.Message, note: Note):
     """Set the folder for saving notes for the current chat"""
     log_basic(f'Received set_folder command for chat {message.chat.id} from @{message.from_user.username}')
-
+    
     current_notes_folder = note.notes_folder
     await answer_message(message, f"""
 Base notes folder: <code>{config.inbox_path}</code>
@@ -159,45 +196,59 @@ Your current notes folder: <code>{current_notes_folder}</code>
         relative_folder_path = ""
     else:
         relative_folder_path = args[1].strip()
-
+    
     # Validate folder path
     folder_path = os.path.join(config.inbox_path, relative_folder_path)
-
+    
     try:
         os.makedirs(folder_path, exist_ok=True)
     except Exception as e:
         await answer_message(message, f"Error creating folder <code>{folder_path}</code>: {e}")
         return
-
+        
     # Save to database
     result = set_notes_folder(message.chat.id, relative_folder_path)
     await answer_message(message, result)
 
-@dp.message(Command("help"))
-async def help(message: types.Message):
-    reply_text = '''/start - start Bot
-    /help - show this help
-    a text or picture message - to be passed into Obsidian inbox
-    an audio message - to be recognized and passed into Obsidian inbox as text
-    '''
-    await message.reply(reply_text)
+@dp.message(Command("tasks"))
+async def command_tasks(message: types.Message, note: Note):
+    """Toggle forced task mode for this chat: /tasks on|off"""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        state = "ON" if get_all_as_tasks(message.chat.id) else "OFF"
+        await answer_message(message, f"All posts as tasks is currently <b>{state}</b>.\nUsage: <code>/tasks on</code> or <code>/tasks off</code>")
+        return
+    enabled = args[1].lower() == "on"
+    result = set_all_as_tasks(message.chat.id, enabled)
+    await answer_message(message, result)
 
-# @dp.message(content_types=[ContentType.VOICE])
+@dp.message(Command("help"))
+async def command_help(message: types.Message, note: Note):
+    reply_text = '''
+/start - start Bot
+/help - show this help
+/set_folder - set or reset custom relative folder for saving notes
+    usage: <code>/set_folder path/to/folder</code>
+    <code>/set_folder</code> without path resets custom folder to the default
+ /tasks on|off - add all posts to vault as tasks for this chat
+text, media, picture message of other kinds of messages - to be passed into Obsidian inbox. Text may be added according to text recognition settings in config
+'''
+    await answer_message(message, reply_text)
+
 @dp.message(F.voice)
-async def handle_voice_message(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_voice_message(message: Message, note: Note):
     log_basic(f'Received voice message from @{message.from_user.username}')
-    log_message(message)
     if not config.recognize_voice:
         log_basic(f'Voice recognition is turned OFF')
         return
-    note = note_from_message(message)
-    voice = await message.voice.get_file()
-    path = os.path.dirname(__file__)
 
-    await handle_file(file=voice, file_name=f"{voice.file_id}.ogg", path=path)
-    file_full_path = os.path.join(path, voice.file_id + '.ogg')
-    await bot.send_chat_action(chat_id=message.from_user.id, action=types.ChatActions.TYPING)
+    path = os.path.dirname(__file__)
+    voice_file = await bot.get_file(message.voice.file_id)
+    voice_file_ext = message.voice.mime_type.split('/')[-1]
+    file_name=f"{message.voice.file_id}.{voice_file_ext}"
+    await handle_file(file=voice_file, file_name=file_name, path=path)
+
+    file_full_path = os.path.join(path, file_name)
 
     try:
         note_stt = await stt(file_full_path)
@@ -211,17 +262,13 @@ async def handle_voice_message(message: Message):
     save_message(note)
     os.remove(file_full_path)
 
-
-# @dp.message_handler(content_types=[ContentType.AUDIO])
 @dp.message(F.audio)
-async def handle_audio(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_audio(message: Message, note: Note):
     log_basic(f'Received audio file from @{message.from_user.username}')
-    log_message(message)
     if not config.recognize_voice:
         log_basic(f'Voice recognition is turned OFF')
         return
-    note = note_from_message(message)
+
     try:
         audio = await message.audio.get_file()
     except Exception as e:
@@ -233,7 +280,7 @@ async def handle_audio(message: Message):
 
     await handle_file(file=audio, file_name=f"{message.audio.file_name}", path=path)
     file_full_path = os.path.join(path, message.audio.file_name)
-    await bot.send_chat_action(chat_id=message.from_user.id, action=types.ChatActions.TYPING)
+
     note_stt = await stt(file_full_path)
     try:
         await answer_message(message, note_stt)
@@ -249,14 +296,10 @@ async def handle_audio(message: Message):
     save_message(note)
     os.remove(file_full_path)
 
-
-# @dp.message_handler(content_types=[ContentType.PHOTO])
 @dp.message(F.photo)
-async def handle_photo(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_photo(message: Message, note: Note):
     log_basic(f'Received photo from @{message.from_user.username}')
-    log_message(message)
-    note = note_from_message(message)
+
     photo = message.photo[-1]
     file_name = unique_indexed_filename(create_media_file_name(message, 'pic', 'jpg'), config.photo_path) # or photo.file_id + '.jpg'
     print(f'Got photo: {file_name}')
@@ -266,21 +309,32 @@ async def handle_photo(message: Message):
 
     forward_info = get_forward_info(message)
     photo_and_caption = f'{forward_info}![[{file_name}]]\n{await embed_formatting_caption(message)}'
-    note.text=photo_and_caption
+
+    # Распознавание текста с фото
+    if config.ocr:
+        image_path = os.path.join(config.photo_path, file_name)
+        recognized_text = await recognize_text_from_image(image_path, ocr_languages)
+        if recognized_text:
+            recognized_text_safe = html_decoration.quote(recognized_text)
+            photo_and_caption += f'\n{recognized_text}'
+            try:
+                await answer_message(message, recognized_text_safe)
+            except Exception as e:
+                await answer_message(message, f'🤷‍♂️ {e}')
+        else:
+            log_basic("No text recognized on the photo.")
+
+    note.text = photo_and_caption
     save_message(note)
 
-# @dp.message_handler(content_types=[ContentType.DOCUMENT])
 @dp.message(F.document)
-async def handle_document(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_document(message: Message, note: Note):
     file_name = unique_filename(message.document.file_name, config.photo_path)
-    log_basic(f'Received document {file_name} from @{message.from_user.username}')
-    log_message(message)
-    note = note_from_message(message)
-    print(f'Got document: {file_name}')
+    log_basic(f'Received document {file_name} ({message.document.mime_type}) from @{message.from_user.username}')
+    print(f'Got document: {file_name} ({message.document.mime_type})')
 
     try:
-        file = await message.document.get_file()
+        file = await bot.get_file(message.document.file_id)
         await handle_file(file=file, file_name=file_name, path=config.photo_path)
     except Exception as e:
         log_basic(f'Exception: {e}')
@@ -305,285 +359,117 @@ async def handle_document(message: Message):
 
         note.text = f'{file_details}\n{note_stt}'
         os.remove(file_full_path)
+    elif message.document.mime_type.split('/')[0] == 'image' and config.ocr:
+        image_path = os.path.join(config.photo_path, file_name)
+        recognized_text = await recognize_text_from_image(image_path, ocr_languages)
+        if recognized_text:
+            recognized_text_safe = html_decoration.quote(recognized_text)
+            note.text += f'\n{recognized_text}'
+            try:
+                await answer_message(message, recognized_text_safe)
+            except Exception as e:
+                await answer_message(message, f'🤷‍♂️ {e}')
+        else:
+            log_basic("No text recognized in the document.")
     else:
         forward_info = get_forward_info(message)
         note.text = f'{forward_info}[[{file_name}]]\n{await embed_formatting_caption(message)}'
 
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.CONTACT])
 @dp.message(F.contact)
-async def handle_contact(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_contact(message: Message, note: Note):
     log_basic(f'Received contact from @{message.from_user.username}')
-    log_message(message)
-    note = note_from_message(message)
+
     print(f'Got contact')
     note.text = await get_contact_data(message)
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.LOCATION])
 @dp.message(F.location)
-async def handle_location(message: Message):
-    if message.chat.id != config.my_chat_id: return
+async def handle_location(message: Message, note: Note):
     log_basic(f'Received location from @{message.from_user.username}')
-    log_message(message)
     print(f'Got location')
-    note = note_from_message(message)
+
     note.text = get_location_note(message)
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.ANIMATION])
 @dp.message(F.animation)
-async def handle_animation(message: Message):
-    if message.chat.id != config.my_chat_id: return
-    log_message(message)
-    file_name = unique_filename(message.document.file_name, config.photo_path)
+async def handle_animation(message: Message, note: Note):
+    if message.document.file_name:
+        file_name = unique_filename(message.document.file_name, config.photo_path)
+    else:
+        file_name = unique_indexed_filename(create_media_file_name(message, 'animation', 'mp4'), config.photo_path)
     log_basic(f'Received animation {file_name} from @{message.from_user.username}')
     print(f'Got animation: {file_name}')
-    note = note_from_message(message)
 
-    file = await message.document.get_file()
-#    file_path = file.file_path
+    file = await bot.get_file(message.document.file_id)
     await handle_file(file=file, file_name=file_name, path=config.photo_path)
 
     forward_info = get_forward_info(message)
     note.text = f'{forward_info}![[{file_name}]]\n{await embed_formatting_caption(message)}'
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.VIDEO])
 @dp.message(F.video)
-async def handle_video(message: Message):
-    if message.chat.id != config.my_chat_id: return
-    log_message(message)
-    file_name = unique_filename(message.video.file_name, config.photo_path)
+async def handle_video(message: Message, note: Note):
+    if message.video.file_name:
+        file_name = unique_filename(message.video.file_name, config.photo_path)
+    else:
+        file_name = unique_indexed_filename(create_media_file_name(message, 'video', 'mp4'), config.photo_path)
     log_basic(f'Received video {file_name} from @{message.from_user.username}')
     print(f'Got video: {file_name}')
-    note = note_from_message(message)
 
-    file = await message.video.get_file()
-#    file_path = file.file_path
+    file = await bot.get_file(message.video.file_id)
+
     await handle_file(file=file, file_name=file_name, path=config.photo_path)
 
     note.text = f'{get_forward_info(message)}![[{file_name}]]\n{await embed_formatting_caption(message)}'
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.VIDEO_NOTE])
 @dp.message(F.video_note)
-async def handle_video_note(message: Message):
-    if message.chat.id != config.my_chat_id: return
-    log_message(message)
+async def handle_video_note(message: Message, note: Note):
     file_name = unique_indexed_filename(create_media_file_name(message.video_note, 'video_note', 'mp4'), config.photo_path)
     log_basic(f'Received video note from @{message.from_user.username}')
     print(f'Got video note: {file_name}')
-    note = note_from_message(message)
 
-    file = await message.video_note.get_file()
-#    file_path = file.file_path
+    file = await bot.get_file(message.video_note.file_id)
+
     await handle_file(file=file, file_name=file_name, path=config.photo_path)
 
     note.text = f'{get_forward_info(message)}![[{file_name}]]\n{await embed_formatting_caption(message)}'
     save_message(note)
 
-
-# @dp.message_handler(content_types=[ContentType.POLL])
-@dp.poll()
-async def handle_poll(message: types.Poll):
-    if message.chat.id != config.my_chat_id: return
-    log_message(message)
-    print(f'Got poll')
-
-@dp.poll_answer()
-async def handle_poll_answer(poll_answer: types.PollAnswer):
-    if message.chat.id != config.my_chat_id: return
-    log_message(poll_answer)
-    print(f'Got poll answer')
-
-# @dp.message_handler()
 @dp.message()
-async def process_message(message: types.Message):
-    if message.chat.id != config.my_chat_id: return
+async def process_message(message: types.Message, note: Note):
     log_basic(f'Received a message from @{message.from_user.username}')
-    log_message(message)
-    note = note_from_message(message)
+
     forward_info = get_forward_info(message)
 
-    if message.photo:
-        # processed above in another function, this code is never reached
-        pass
-    #     log_basic(f'Detected a photo')
-    #     photo = message.photo[-1]
-    #     file_name = unique_indexed_filename(create_media_file_name(message, 'pic', 'jpg'), config.photo_path) # or photo.file_id + '.jpg'
-    #     print(f'Got photo: {file_name}')
-    #     photo_file = await bot.get_file(photo.file_id)
-    #     result = await handle_file(file=photo_file, file_name=file_name, path=config.photo_path)
-    #     print(f'Success: {result}')
-
-    #     photo_and_caption = f'{forward_info}![[{file_name}]]\n{await embed_formatting_caption(message)}'
-    #     note.text=photo_and_caption
-
-    elif message.sticker:
-        log_basic(f'Detected a sticker')
-        photo = message.sticker
-        file_name = unique_indexed_filename(create_media_file_name(message, 'pic', 'webp'), config.photo_path) # or photo.file_id + '.jpg'
-        print(f'Got sticker: {file_name}')
-        photo_file = await bot.get_file(photo.file_id)
-        result = await handle_file(file=photo_file, file_name=file_name, path=config.photo_path)
-        print(f'Success: {result}')
-
-        photo_and_caption = f'{forward_info}![[{file_name}]]\n{await embed_formatting_caption(message)}'
-        note.text=photo_and_caption
-
-    elif message.voice:
-        log_basic(f'Detected voice message')
-#        log_basic(f'Received audio file from @{message.from_user.username}')
-#        log_message(message)
-        if not config.recognize_voice:
-            log_basic(f'Voice recognition is turned OFF')
-            return
-        note = note_from_message(message)
-
-        path = os.path.dirname(__file__)
-        voice_file = await bot.get_file(message.voice.file_id)
-        voice_file_ext = message.voice.mime_type.split('/')[-1]
-        file_name=f"{message.voice.file_id}.{voice_file_ext}"
-        await handle_file(file=voice_file, file_name=file_name, path=path)
-
-        file_full_path = os.path.join(path, file_name)
-        await bot.send_chat_action(chat_id=message.from_user.id, action='typing')
-        try:
-            note_stt = await stt(file_full_path)
-            note.text = note_stt
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        try:
-            await answer_message(message, note_stt)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        os.remove(file_full_path)
-    elif message.video_note:
-        log_basic(f'Detected video note')
-        if not config.recognize_voice:
-            log_basic(f'Voice recognition is turned OFF')
-            return
-        note = note_from_message(message)
-
-        path = os.path.dirname(__file__)
-        video_note_file = await bot.get_file(message.video_note.file_id)
-        video_note_file_ext = '.mp4'
-        file_name=f"{message.video_note.file_id}.{video_note_file_ext}"
-        await handle_file(file=video_note_file, file_name=file_name, path=path)
-
-        file_full_path = os.path.join(path, file_name)
-        await bot.send_chat_action(chat_id=message.from_user.id, action='typing')
-        try:
-            note_stt = await stt(file_full_path)
-            note.text = note_stt
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        try:
-            await answer_message(message, note_stt)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        os.remove(file_full_path)
-
-    elif message.video:
-        log_basic(f'Detected video')
-        if not config.recognize_voice:
-            log_basic(f'Voice recognition is turned OFF')
-            return
-        note = note_from_message(message)
-
-        path = os.path.dirname(__file__)
-        try:
-            media_file = await bot.get_file(message.video.file_id)
-#        media_file_ext = message.audio.mime_type.split('/')[-1]
-            file_name= message.video.file_name
-            await handle_file(file=media_file, file_name=file_name, path=path)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-            note.text = f'{message.caption}\n' if message.caption else ""
-            note.text += f'🤷‍♂️ {e}: {message.video.file_name} ({message.video.file_size} bytes)'
-            save_message(note)
-            return
-        file_full_path = os.path.join(path, file_name)
-        await bot.send_chat_action(chat_id=message.from_user.id, action='typing')
-        try:
-            note_stt = await stt(file_full_path)
-            note.text = note_stt
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        try:
-            await answer_message(message, note_stt)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        os.remove(file_full_path)
-
-    elif message.audio:
-        log_basic(f'Detected audio message')
-        if not config.recognize_voice:
-            log_basic(f'Voice recognition is turned OFF')
-            return
-        note = note_from_message(message)
-
-        path = os.path.dirname(__file__)
-        try:
-            media_file = await bot.get_file(message.audio.file_id)
-#        media_file_ext = message.audio.mime_type.split('/')[-1]
-            file_name= message.audio.file_name
-            await handle_file(file=media_file, file_name=file_name, path=path)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-            note.text = f'{message.audio.performer}\n' if message.audio.performer else ""
-            note.text = f'{message.caption}\n' if message.caption else ""
-            note.text += f'🤷‍♂️ {e}: {message.audio.file_name} ({message.audio.file_size} bytes)'
-            save_message(note)
-            return
-
-        file_full_path = os.path.join(path, file_name)
-        await bot.send_chat_action(chat_id=message.from_user.id, action='typing')
-
-        note.text = f'{message.audio.performer}\n' if message.audio.performer else ""
-
-        try:
-            note_stt = await stt(file_full_path)
-            note.text += note_stt
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        try:
-            await answer_message(message, note_stt)
-        except Exception as e:
-            await answer_message(message, f'🤷‍♂️ {e}')
-        os.remove(file_full_path)
-
-    elif message.poll:
-        log_basic(f'Detected a poll')
-        poll_options = ', '.join([option.text for option in message.poll.options])
-        note.text = f"{message.poll.question} ({poll_options})"
-    else:
-        message_body = await embed_formatting(message)
-        note.text = forward_info + message_body
+    message_body = await embed_formatting(message)
+    note.text = forward_info + message_body
 
     if message.link_preview_options:
         if message.link_preview_options.url and 'youtu' in message.link_preview_options.url:
             note.text += f'\n![{message.link_preview_options.url}]({message.link_preview_options.url})\n'
 
     save_message(note)
-    await bot.set_message_reaction(chat_id=message.from_user.id, message_id=message.message_id, reaction=[{'type':'emoji', 'emoji':'👌'}])
-
 
 # Functions
 
 # Download the photo using aiohttp
 async def handle_file(file: File, file_name: str, path: str):
+    """
+    Downloads a file from Telegram and saves it to the specified path.
+
+    Parameters:
+    file (File): The file object containing the file path on Telegram's server.
+    file_name (str): The name to save the file as.
+    path (str): The directory path where the file will be saved.
+
+    Returns:
+    bool: True if the file was successfully downloaded and saved, False otherwise.
+    """
     Path(f"{path}").mkdir(parents=True, exist_ok=True)
     destination = f"{path}/{file_name}"
-#    await bot.download_file(file_path=file.file_path, destination=f"{path}/{file_name}")
     async with aiohttp.ClientSession() as session:
         async with session.get(f"https://api.telegram.org/file/bot{config.token}/{file.file_path}") as resp:
             if resp.status == 200:
@@ -591,7 +477,6 @@ async def handle_file(file: File, file_name: str, path: str):
                 await f.write(await resp.read())
                 await f.close()
     return (resp.status == 200)
-
 
 def get_forward_info(m: Message) -> str:
     # If the message is forwarded, extract forward info and make up forward header
@@ -615,7 +500,7 @@ def get_forward_info(m: Message) -> str:
             post = f'[message](https://t.me/c/{chat_id}/{msg_id})'
 
     if m.forward_from:
-
+        
         forwarded = True
         real_name = ''
         if m.forward_from.first_name:
@@ -642,7 +527,7 @@ def get_forward_info(m: Message) -> str:
 
 def log_message(message):
     # Saving of the whole message into the incoming message log just in case
-    if debug_log:
+    if debug_log:        
         curr_date = dt.now().strftime('%Y-%m-%d')
         curr_time = dt.now().strftime('%H:%M:%S')
         file_name = 'messages-' + curr_date + '.txt'
@@ -657,24 +542,24 @@ def get_note_file_name_parts(curr_date):
     filename_part2 = curr_date if 'note_date' in dir(config) and config.note_date is True else ''
     return [filename_part1, filename_part2, filename_part3]
 
-def get_note_name(curr_date) -> str:
+def get_note_name(curr_date, notes_folder) -> str:
     date_parts = curr_date.split('-')
-    year, month, day = date_parts[0], date_parts[1], date_parts[2]
-    
+    year, month, day = date_parts[0], date_parts[1], date_parts[2] # type: ignore
+
     note_name = config.note_name_template.format(year=year, month=month, day=day)
-    return os.path.join(config.inbox_path, f'{note_name}.md')
+    return os.path.join(notes_folder, f'{note_name}.md')
 
 
 def create_media_file_name(message: Message, suffix = 'media', ext = 'jpg') -> str:
     curr_date = get_curr_date()
     date_parts = curr_date.split('-')
     year, month, day = date_parts[0], date_parts[1], date_parts[2]
-    
+
     note_name = config.note_name_template.format(year=year, month=month, day=day)
-    
+
     # Remove unnecessary characters from the file name
     note_name = re.sub(r'[^\w\-_\.]', '_', note_name)
-    
+
     return f'{curr_date}_{note_name}_{suffix}.{ext}'
 
 
@@ -694,29 +579,65 @@ def format_messages() -> bool:
 def create_link_info() -> bool:
     return False if 'create_link_info' not in dir(config) else config.create_link_info
 
+
 def save_message(note: Note) -> None:
     curr_date = note.date
     curr_time = note.time
-
+    
     relative_folder_path = note.notes_folder
     folder_path = os.path.join(config.inbox_path, relative_folder_path)
-
+    
     if one_line_note():
         # Replace all line breaks with spaces and make simple time stamp
         note_body = note.text.replace('\n', ' ')
-        note_text = check_if_task(check_if_negative(f'[[{curr_date}]] - {note_body}\n'))
+        note_text = check_if_task(check_if_negative(f'[[{curr_date}]] - {note_body}\n'), getattr(note, 'all_as_tasks', False))
     else:
         # Keep line breaks and add a header with a time stamp
-        note_body = check_if_task(check_if_negative(note.text))
-        note_text = f'#### [[{curr_date}]] {curr_time}\n{note_body}\n\n'
-    with open(get_note_name(curr_date), 'a', encoding='UTF-8') as f:
+        note_body = check_if_task(check_if_negative(note.text), getattr(note, 'all_as_tasks', False))
+        if hasattr(note, 'message') and not should_add_timestamp(note.message):
+            note_text = f'{note_body}\n\n'
+        else:
+            note_text = f'#### [[{curr_date}]] {curr_time}\n{note_body}\n\n'
+
+    with open(get_note_name(curr_date, folder_path), 'a', encoding='UTF-8') as f:
         f.write(note_text)
 
-def check_if_task(note_body) -> str:
+def _task_suffix_forced() -> str:
+    """Build the suffix to append to a forced task: ' ➕ today 📅 tomorrow'"""
+    now_local = dt.now(timezone(config.time_zone))
+    today = now_local.strftime('%Y-%m-%d')
+    tomorrow = (now_local + timedelta(days=1)).strftime('%Y-%m-%d')
+    return f' ➕ {today} 📅 {tomorrow}'
+
+def check_if_task(note_body: str, force_task: bool = False) -> str:
+    """
+    Add task marker to note body when needed.
+    - If force_task=True: make only the first line a task (if not already), append suffix, leave the rest as-is.
+    - Else: legacy keyword-based detection; do not duplicate checkbox if already present.
+    """
+    checkbox_re = r'^\s*-\s*\[\s*[xX ]\s*\]\s'
+
+    if force_task:
+        lines = note_body.split('\n') if note_body else ['']
+        first = lines[0] if lines else ''
+        if not re.match(checkbox_re, first):
+            first = f'- [ ] {first}{_task_suffix_forced()}'
+        else:
+            # already a task; ensure suffix appended once
+            if _task_suffix_forced() not in first:
+                first = f'{first}{_task_suffix_forced()}'
+        if len(lines) > 1:
+            return '\n'.join([first] + lines[1:])
+        return first
+
+    # keyword-based detection
     is_task = False
     for keyword in config.task_keywords:
-        if keyword.lower() in note_body.lower(): is_task = True
-    if is_task: note_body = '- [ ] ' + note_body
+        if keyword.lower() in note_body.lower():
+            is_task = True
+            break
+    if is_task and not re.match(checkbox_re, note_body):
+        note_body = '- [ ] ' + note_body
     return note_body
 
 def check_if_negative(note_body) -> str:
@@ -756,6 +677,7 @@ formats = {'bold': ('**', '**'),
            'underline': ('<u>', '</u>'),
            'strikethrough': ('~~', '~~'),
            'code': ('`', '`'),
+           'spoiler': ('==', '=='),
 }
 
 def parse_entities(text: bytes,
@@ -765,14 +687,14 @@ def parse_entities(text: bytes,
     formatted_note = ''
 
     for entity_index, entity in enumerate(entities):
-        entity_start = entity['offset'] * 2
+        entity_start = entity.offset * 2
         if entity_start < offset:
             continue
         if entity_start > offset:
             formatted_note += from_u16(text[offset:entity_start])
-        offset = entity_end = entity_start + entity['length'] * 2
+        offset = entity_end = entity_start + entity.length * 2
 
-        format = entity['type']
+        format = entity.type
         if format == 'pre':
             pre_content = from_u16(text[entity_start:entity_end])
             content_parts = partition_string(pre_content)
@@ -788,8 +710,8 @@ def parse_entities(text: bytes,
                from_u16(text[entity_end:entity_end+2])[0] != '\n'):
                 formatted_note += '\n'
             continue
-        # parse nested entities for exampe: "**bold _italic_**
-        sub_entities = [e for e in entities[entity_index + 1:] if e['offset'] * 2 < entity_end]
+        # parse nested entities for example: "**bold _italic_**"
+        sub_entities = [e for e in entities[entity_index + 1:] if e.offset * 2 < entity_end]
         parsed_entity = parse_entities(text, sub_entities, entity_start, entity_end)
         content_parts = partition_string(parsed_entity)
         content = content_parts[1]
@@ -798,22 +720,22 @@ def parse_entities(text: bytes,
             formatted_note += content_parts[0]
             i = 0
             while i < len(content):
-                index = content.find('\n\n', i) # inline formatting acros paragraphs, need to split
+                index = content.find('\n\n', i) # inline formatting across paragraphs, need to split
                 if index == -1:
-                    formatted_note += format_code[0] + content[i:] + format_code[1]
+                    formatted_note += format_code[0] + content[i:] + format_code[1] # type: ignore
                     break
-                formatted_note += format_code[0] + content[i:index] + format_code[1]
+                formatted_note += format_code[0] + content[i:index] + format_code[1] # type: ignore
                 i = index
-                while i < len(content) and content[i] == '\n':
+                while i < len(content) and content[i] == '\n': # type: ignore
                     formatted_note += '\n'
                     i += 1
             formatted_note += content_parts[2]
             continue
         if format == 'mention':
-            formatted_note += f'{content_parts[0]}[{content}](https://t.me/{content[1:]}){content_parts[2]}'
+            formatted_note += f'{content_parts[0]}[{content}](https://t.me/{content[1:]}){content_parts[2]}' # type: ignore
             continue
         if format == 'text_link':
-            formatted_note += f'{content_parts[0]}[{content}]({entity["url"]}){content_parts[2]}'
+            formatted_note += f'{content_parts[0]}[{content}]({entity.url}){content_parts[2]}'
             continue
         # Not processed (makes no sense): url, hashtag, cashtag, bot_command, email, phone_number
         # Not processed (hard to visualize using Markdown): spoiler, text_mention, custom_emoji
@@ -827,14 +749,14 @@ def is_single_url(message: Message) -> bool:
     # assuming there is atleast one entity
     entities = message.entities
     url_entity = entities[0]
-    if url_entity['type'] == "url":
+    if url_entity.type == "url":
         return True
-    if url_entity['type'] != "text_link":
+    if url_entity.type != "text_link":
         return False
     # need to check nested entities
-    url_end = url_entity['offset'] + url_entity['length']
+    url_end = url_entity.offset + url_entity.length
     for e in entities[1:]:
-        if e['offset'] > url_end:
+        if e.offset > url_end:
             return False
     return True
 
@@ -889,7 +811,7 @@ async def get_url_info_formatting(url: str) -> str:
         return ''
 
 async def embed_formatting(message: Message) -> str:
-    # If the message contains any formatting (inclusing inline links), add corresponding Markdown markup
+    # If the message contains any formatting (including inline links), add corresponding Markdown markup
     note = message.text or ""
 
     if not format_messages():
@@ -915,7 +837,7 @@ async def embed_formatting(message: Message) -> str:
 
 
 async def embed_formatting_caption(message: Message) -> str:
-    # If the message contains any formatting (inclusing inline links), add corresponding Markdown markup
+    # If the message contains any formatting (including inline links), add corresponding Markdown markup
     note = message.caption or ""
 
     if not format_messages():
@@ -939,28 +861,39 @@ async def embed_formatting_caption(message: Message) -> str:
         formatted_note = note
     return formatted_note
 
-async def stt(audio_file_path) -> str:
-    import whisper
-    model = config.whisper_model if 'whisper_model' in dir(config) else 'medium'
-    whisper_device = 'cpu' if 'whisper_device' not in dir(config) else config.whisper_device
-    if whisper_device == 'cpu':
-        model = whisper.load_model(model)
-    else:
-        model = whisper.load_model(model).to(whisper_device)
+async def recognize_text_from_image(image_path: str, ocr_languages: str) -> str:
+    """
+    Recognizes text from an image using OCR.
 
-    log_basic(f'Audio recognition started on {whisper_device}')
-    result = model.transcribe(audio_file_path, verbose = False, language = 'ru')
-    if whisper_device == 'cuda':
+    Parameters:
+    image_path (str): The path to the image file.
+    ocr_languages (str): The languages to use for OCR.
+
+    Returns:
+    str: The recognized text.
+    """
+    try:
+        img = Image.open(image_path)
+        recognized_text = pytesseract.image_to_string(img, lang=ocr_languages)
+        return recognized_text.strip()
+    except Exception as e:
+        log_basic(f'Error during text recognition from {image_path} in {ocr_languages}: {e}')
+        return ''
+
+async def stt(audio_file_path) -> str:
+    log_basic(f'Starting audio recognition on {whisper_device}')
+
+    result = model.transcribe(audio_file_path, verbose=False, language='ru')
+
+    if whisper_device == 'cuda' and torch.cuda.is_available():
         # Clear GPU memory
-        del model
-        gc.collect()
         torch.cuda.empty_cache()
 
-    if hasattr(result['segments'], '__iter__'):
-        rawtext = ' '.join([segment['text'].strip() for segment in result['segments']])
+    if hasattr(result['segments'], '__iter__'): # type: ignore
+        rawtext = ' '.join([segment['text'].strip() for segment in result['segments']]) # type: ignore
         rawtext = re.sub(" +", " ", rawtext)
 
-        alltext = re.sub("([\.\!\?]) ", "\\1\n", rawtext)
+        alltext = re.sub(r"([\.\!\?]) ", "\\1\n", rawtext)
         if debug_log:
             log_debug(f'Recognized: {alltext}')
         else:
@@ -1139,11 +1072,11 @@ def bold(text: str) -> str:
 def note_from_message(message: Message, notes_folder: str) -> Note:
     """
     Create Note object from Telegram message
-
+    
     Args:
         message (Message): Telegram message
         notes_folder (str): Folder path for saving notes
-
+        
     Returns:
         Note: Note object with message metadata
     """
@@ -1151,20 +1084,15 @@ def note_from_message(message: Message, notes_folder: str) -> Note:
     message_date = message.date.astimezone(local_tz)
     msg_date = message_date.strftime('%Y-%m-%d')
     msg_time = message_date.strftime('%H:%M:%S')
-    note = Note(date=msg_date, time=msg_time)
-    return note
+    return Note(date=msg_date, time=msg_time, notes_folder=notes_folder, message=message)
 
 
 async def main() -> None:
     # Initialize Bot instance with a default parse mode which will be passed to all API calls
-#    bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
-#dp = Dispatcher()
     # And the run events dispatching
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
     print('Bot started')
-#    executor.start_polling(dp, skip_updates=False, relax = 1)
-#    asyncio.get_event_loop().run_until_complete(main())
     asyncio.run(main())
 # The code below never runs
