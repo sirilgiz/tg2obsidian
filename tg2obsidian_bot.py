@@ -1,6 +1,6 @@
 # tg2obsidian_bot - pulls posts from your private Telegram group
 # and puts them in daily inbox note in your Obsidian vault
-# Copyright (c) 2023-2024, Dmitry Ulanov
+# Copyright (c) 2023-2025, Dmitry Ulanov
 # https://github.com/dimonier/tg2obsidian
 
 import os
@@ -10,6 +10,7 @@ import aiohttp
 import time
 import asyncio
 import aiofiles
+import warnings
 
 from pathlib import Path
 from datetime import datetime as dt
@@ -23,10 +24,53 @@ from aiogram.types import ContentType, File, Message, MessageEntity, Poll, PollA
 from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
 from aiogram.enums import ParseMode
 from aiogram.methods.set_message_reaction import SetMessageReaction
+from aiogram.utils.text_decorations import html_decoration
+from database import set_notes_folder, get_notes_folder
+from aiogram.client.default import DefaultBotProperties
 
 import config
+allowed_chats = [int(x) for x in config.allowed_chats.split(':')]
 
-bot = Bot(token = config.token, parse_mode=ParseMode.HTML)
+# Для группировки отправленных вместе сообщений
+last_message_times = {}
+
+# TODO: assign values of config variables to local variables using the form `my_chat_id = getattr(config, "my_chat_id", 123456789)` and change all references to these variables accordingly
+
+# Игнорируем предупреждение о FP16 на CPU
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
+
+class CommonMiddleware(BaseMiddleware):
+
+    async def __call__(self, handler, event: types.Update, data: dict):
+        message = event.message
+        if message:
+            await bot.send_chat_action(chat_id=message.from_user.id, action='typing')
+            # Логирование сообщения
+            log_message(message)
+
+            # Проверка идентификатора чата
+            if message.chat.id not in allowed_chats:
+                await message.reply(f"I'm not configured to accept messages in this chat.\nIf you think I should do so, please add <code>{message.chat.id}</code> to <b>allowed_chats</b> in config.")
+                return
+
+            notes_folder = get_notes_folder(message.chat.id)
+            note = note_from_message(message, notes_folder)
+            data["note"] = note
+        try:
+            result = await handler(event, data)
+            if 'delete_messages' in dir(config) and config.delete_messages:
+                await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+            else:
+                await bot.set_message_reaction(chat_id=message.from_user.id, message_id=message.message_id, reaction=[{'type':'emoji', 'emoji':'👌'}])
+            return result
+        except Exception as e:
+            log_basic(f'Exception: {e}')
+            print(f'Exception: {e}')
+            await bot.set_message_reaction(chat_id=message.from_user.id, message_id=message.message_id, reaction=[{'type':'emoji', 'emoji':'🤷‍♂'}])
+            await answer_message(message, f'🤷‍♂️ {e}')
+            return
+
+bot = Bot(token=config.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 # router = Router()
 dp = Dispatcher()
 
@@ -52,7 +96,42 @@ if 'log_level' in dir(config) and config.log_level >= 1:
 if config.recognize_voice:
     import torch
     import gc
-    print('Prepared for speech-to-text recognition')
+
+    whisper_device = getattr(config, 'whisper_device', 'cpu')
+
+    if whisper_device == 'cpu':
+        torch.cuda.is_available = lambda : False
+
+    model = whisper.load_model(config.whisper_model)
+
+    if whisper_device == 'cuda' and torch.cuda.is_available():
+        model = model.to('cuda')
+    else:
+        model = model.to('cpu')
+
+    print(f'Prepared for speech-to-text recognition on {whisper_device}')
+
+def should_add_timestamp(message: Message) -> bool:
+    """
+    Check if we should add timestamp for the message based on time difference with previous message.
+
+    Args:
+        message (Message): Current message
+
+    Returns:
+        bool: True if timestamp should be added, False otherwise
+    """
+    chat_id = message.chat.id
+    current_time = message.date
+
+    if chat_id not in last_message_times:
+        last_message_times[chat_id] = current_time
+        return True
+
+    time_diff = (current_time - last_message_times[chat_id]).total_seconds()
+    last_message_times[chat_id] = current_time
+
+    return time_diff >= config.message_timestamp_interval
 
 # Handlers
 @dp.message(Command("start"))
@@ -62,6 +141,37 @@ async def send_welcome(message: types.Message):
     )
     reply_text = f"Hello {message.from_user.full_name}!\n\nI`m a private bot, I save messages from a private Telegram group to Obsidian inbox.\n\nYour Id: {message.from_user.id}\nThis chat Id: {message.chat.id}\n"
     await message.reply(reply_text)
+
+@dp.message(Command("set_folder"))
+async def command_set_folder(message: types.Message, note: Note):
+    """Set the folder for saving notes for the current chat"""
+    log_basic(f'Received set_folder command for chat {message.chat.id} from @{message.from_user.username}')
+
+    current_notes_folder = note.notes_folder
+    await answer_message(message, f"""
+Base notes folder: <code>{config.inbox_path}</code>
+Your current notes folder: <code>{current_notes_folder}</code>
+        """)
+
+    # Get folder path from command arguments
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        relative_folder_path = ""
+    else:
+        relative_folder_path = args[1].strip()
+
+    # Validate folder path
+    folder_path = os.path.join(config.inbox_path, relative_folder_path)
+
+    try:
+        os.makedirs(folder_path, exist_ok=True)
+    except Exception as e:
+        await answer_message(message, f"Error creating folder <code>{folder_path}</code>: {e}")
+        return
+
+    # Save to database
+    result = set_notes_folder(message.chat.id, relative_folder_path)
+    await answer_message(message, result)
 
 @dp.message(Command("help"))
 async def help(message: types.Message):
@@ -505,6 +615,7 @@ def get_forward_info(m: Message) -> str:
             post = f'[message](https://t.me/c/{chat_id}/{msg_id})'
 
     if m.forward_from:
+
         forwarded = True
         real_name = ''
         if m.forward_from.first_name:
@@ -586,6 +697,10 @@ def create_link_info() -> bool:
 def save_message(note: Note) -> None:
     curr_date = note.date
     curr_time = note.time
+
+    relative_folder_path = note.notes_folder
+    folder_path = os.path.join(config.inbox_path, relative_folder_path)
+
     if one_line_note():
         # Replace all line breaks with spaces and make simple time stamp
         note_body = note.text.replace('\n', ' ')
@@ -1021,7 +1136,17 @@ def bold(text: str) -> str:
         return text
 
 
-def note_from_message(message: Message):
+def note_from_message(message: Message, notes_folder: str) -> Note:
+    """
+    Create Note object from Telegram message
+
+    Args:
+        message (Message): Telegram message
+        notes_folder (str): Folder path for saving notes
+
+    Returns:
+        Note: Note object with message metadata
+    """
     local_tz = timezone(config.time_zone)
     message_date = message.date.astimezone(local_tz)
     msg_date = message_date.strftime('%Y-%m-%d')
