@@ -17,16 +17,17 @@ This readme is also available [in Russian](README.ru.md).
 - One or more Teleram users could send messages to the Obsidian vault.
 - Each user could use custom folder to store notes coming from Teleram.
 - All messages are grouped by date — one note per day/month/year (according to the note name template) — or stored in a single note.
-- Each message in a note has a header with a timestamp.
+- Each message in a note has a header with a timestamp (can be suppressed for rapid message bursts).
 - Depending on the settings, message formatting is either preserved or ignored.
 - For forwarded messages, information about the message source is added.
 - Photographs, animations, videos, and documents are saved in the vault and embedded in the note.
 - Contacts are saved as YAML front matter and vcard.
 - For locations, links to Google Maps and Yandex.Maps are created.
 - There is an option to convert notes with specific keywords into tasks.
+- There is an option to force all posts into tasks per chat via `/tasks on|off`.
 - There is an option to tag notes with specific keywords.
 - There is an option for OCR on images. In this case, the Bot sends the recognized text as a reply to the original message.
-- There is an option for speech recognition from voice messages and audio messages. In this case, the Bot sends the recognized text as a reply to the original message.
+- There is an option for speech recognition from voice messages and audio messages (local Whisper or cloud OpenAI-compatible API). In this case, the Bot sends the recognized text as a reply to the original message.
 - After processing a message, the bot adds OK emoji to it.
 
 ## Installation and Setup
@@ -55,8 +56,9 @@ pip install -r requirements.txt
 
 ### If Speech Recognition is Required
 
-1. Install the compiled [FFMPEG](https://ffmpeg.org/download.html) and add the path to the executable file (ffmpeg.exe on Windows) to the system's PATH environment variable.
+1. For local Whisper: install the compiled [FFMPEG](https://ffmpeg.org/download.html) and add the path to the executable file (ffmpeg.exe on Windows) to the system's PATH environment variable.
 2. Navigate to the folder containing this script and ensure that ffmpeg.exe can be run from it.
+3. For cloud STT: set `stt_provider = "cloud"` and fill `stt_base_url`, `stt_api_key`, `stt_model_name`, `stt_language` in `config.py` (OpenAI-compatible API).
 
 ## Usage
 
@@ -71,3 +73,14 @@ python tg2obsidian_bot.py
 - If you only turn on your computer when you need to use it, run the Bot immediately when you need to receive messages in Obsidian, and close the program after receiving all messages.
 
 **Important!** The Bot can only receive messages from the last 24 hours due to lifetime of [Telegram updates](https://core.telegram.org/bots/api#getting-updates). If more than 24 hours have passed since a message was sent before the Bot is run, that message will not be received by the Bot.
+
+### Bot Commands
+
+- `/start` — show chat id for `allowed_chats`.
+- `/help` — show help.
+- `/set_folder <path>` — set custom relative notes folder for the current chat.
+- `/tasks on|off` — force all posts from this chat to be tasks (adds a task suffix).
+
+### Timestamp Grouping
+
+To avoid repeating timestamps for bursts of messages, set `message_timestamp_interval` in `config.py` (seconds). If a message arrives within this interval, the header timestamp is omitted for that message.
