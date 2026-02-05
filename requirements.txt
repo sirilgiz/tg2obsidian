@@ -7,4 +7,5 @@ torch
 torchvision
 torchaudio
 openai_whisper
+pytesseract
 openai

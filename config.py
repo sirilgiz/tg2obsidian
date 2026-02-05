@@ -1,6 +1,12 @@
 # Bot token issued by @botfather (Telegram)
 token = 'xxxxxxxx:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 
+# The IDs of chats the bot should read, separated by colons. Messages from other chats will be ignored.
+# A single chat can be specified like '123456789'.
+# Multiple chats can be specified like '123456789:987654321:111222333'.
+# When the bot receives the /start command in any chat, it replies with that chat's ID which can be added here.
+allowed_chats = '123456789:987654321'
+
 # Path to the folder where new notes should be created
 inbox_path = r'C:\your-obsidian-vault'
 
@@ -11,6 +17,9 @@ photo_path = r'C:\your-obsidian-vault\attachments'
 # If False, messages will be saved as plain text. This also removes inline links.
 format_messages = True
 
+# If True, messages will be deleted after processing.
+delete_messages = False
+
 #if True, callout block containing link information such as description and/or image will be created
 # for messages containing single url
 #if False, or more than one url in the message, no callout will be created
@@ -18,6 +27,14 @@ create_link_info = True
 
 # Time zone for time stamp formatting
 time_zone = 'Europe/Moscow'
+
+# If True, optical character recognition (OCR) will be performed on images.
+# This requires tesseract (https://github.com/tesseract-ocr/tessdoc) to be installed and added to PATH
+# If False, OCR will not be applied to received images.
+ocr = False
+
+# One or more languages to use for OCR. Defaults to 'eng'. Few languages should be delimited with +.
+ocr_languages = 'rus+eng'
 
 # If True, voice messages will be recognized to text.
 # If False, voice messages will not be recognized nor stored.
@@ -71,6 +88,3 @@ negative_keywords = {'негатив', 'печал'}
 # Tag to add to the text where a keyword is detected
 negative_tag = '#негатив'
 
-# The ID of the chat the bot should read. Messages from other chats will be ignored.
-# When the bot receives the /start command, it replies with the ID of the chat.
-my_chat_id = -xxxxxxxxx

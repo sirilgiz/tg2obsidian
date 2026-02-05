@@ -2,8 +2,6 @@ import logging
 import sqlite3
 from sqlite3 import Error
 
-from config import inbox_path
-
 logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO, filename = 'bot.log', encoding = 'UTF-8', datefmt = '%Y-%m-%d %H:%M:%S')
 
 def create_connection():

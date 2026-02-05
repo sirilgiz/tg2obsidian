@@ -16,14 +16,11 @@ from pathlib import Path
 from datetime import datetime as dt, timedelta
 from bs4 import BeautifulSoup
 from pytz import timezone
-import urllib.request
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
-from aiogram.filters import Filter, Command
-from aiogram.types import ContentType, File, Message, MessageEntity, Poll, PollAnswer
-from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
+from aiogram.filters import Command
+from aiogram.types import File, Message, MessageEntity
 from aiogram.enums import ParseMode
-from aiogram.methods.set_message_reaction import SetMessageReaction
 from aiogram.utils.text_decorations import html_decoration
 from database import set_notes_folder, get_notes_folder, get_all_as_tasks, set_all_as_tasks
 from aiogram.client.default import DefaultBotProperties
@@ -79,7 +76,6 @@ bot = Bot(token=config.token, default=DefaultBotProperties(parse_mode=ParseMode.
 # router = Router()
 dp = Dispatcher()
 dp.update.middleware(CommonMiddleware())  # Регистрация middleware
-
 
 async def _set_bot_commands(bot: Bot) -> None:
     """Register bot commands in Telegram UI on startup."""
@@ -159,7 +155,6 @@ if config.recognize_voice:
     else:
         import torch
         import whisper
-        import gc
 
         whisper_device = getattr(config, 'whisper_device', 'cpu')
 
@@ -267,7 +262,7 @@ text, media, picture message of other kinds of messages - to be passed into Obsi
 async def handle_voice_message(message: Message, note: Note):
     log_basic(f'Received voice message from @{message.from_user.username}')
     if not config.recognize_voice:
-        log_basic(f'Voice recognition is turned OFF')
+        log_basic('Voice recognition is turned OFF')
         return
 
     path = os.path.dirname(__file__)
@@ -294,7 +289,7 @@ async def handle_voice_message(message: Message, note: Note):
 async def handle_audio(message: Message, note: Note):
     log_basic(f'Received audio file from @{message.from_user.username}')
     if not config.recognize_voice:
-        log_basic(f'Voice recognition is turned OFF')
+        log_basic('Voice recognition is turned OFF')
         return
 
     try:
@@ -315,7 +310,7 @@ async def handle_audio(message: Message, note: Note):
     except Exception as e:
         await answer_message(message, f'🤷‍♂️ {e}')
     # Add label, if any, and a file name
-    if message.caption != None:
+    if message.caption is not None:
         file_details = f'{bold(message.caption)} ({message.audio.file_name})'
     else:
         file_details = bold(message.audio.file_name)
@@ -370,7 +365,7 @@ async def handle_document(message: Message, note: Note):
         return
 
     if config.recognize_voice and message.document.mime_type.split('/')[0] == 'audio':
-    # if mime type = "audio/*", recognize it like ContentType.AUDIO
+        # if mime type = "audio/*", recognize it like ContentType.AUDIO
         await bot.send_chat_action(chat_id=message.from_user.id, action=types.ChatActions.TYPING)
 
         file_full_path = os.path.join(config.photo_path, file_name)
@@ -380,7 +375,7 @@ async def handle_document(message: Message, note: Note):
         except Exception as e:
             await answer_message(message, f'🤷‍♂️ {e}')
         # Add label, if any, and a file name
-        if message.caption != None:
+        if message.caption is not None:
             file_details = f'{bold(message.caption)} ({file_name})'
         else:
             file_details = bold(file_name)
@@ -409,14 +404,14 @@ async def handle_document(message: Message, note: Note):
 async def handle_contact(message: Message, note: Note):
     log_basic(f'Received contact from @{message.from_user.username}')
 
-    print(f'Got contact')
+    print('Got contact')
     note.text = await get_contact_data(message)
     save_message(note)
 
 @dp.message(F.location)
 async def handle_location(message: Message, note: Note):
     log_basic(f'Received location from @{message.from_user.username}')
-    print(f'Got location')
+    print('Got location')
 
     note.text = get_location_note(message)
     save_message(note)
@@ -596,7 +591,7 @@ def get_curr_date() -> str:
 
 
 def one_line_note() -> bool:
-    one_line_note = False if 'one_line_note' not in dir(config) or config.one_line_note == False else True
+    one_line_note = False if 'one_line_note' not in dir(config) or not config.one_line_note else True
     return one_line_note
 
 
@@ -671,8 +666,10 @@ def check_if_task(note_body: str, force_task: bool = False) -> str:
 def check_if_negative(note_body) -> str:
     is_negative = False
     for keyword in config.negative_keywords:
-        if keyword.lower() in note_body.lower(): is_negative = True
-    if is_negative: note_body += f'\n{config.negative_tag}'
+        if keyword.lower() in note_body.lower():
+            is_negative = True
+    if is_negative:
+        note_body += f'\n{config.negative_tag}'
     return note_body
 
 # returns index of a first non ws character in a string
@@ -798,11 +795,11 @@ def get_open_graph_props(page: str) -> dict:
     meta = soup.find_all("meta", property=lambda x: x is not None and x.startswith("og:"))
     for m in meta:
         props[m['property'][3:].lstrip()] = m['content']
-    if not 'description' in props:
+    if 'description' not in props:
         m = soup.find("meta", attrs={"name": "description"})
         if m:
             props['description'] = m['content']
-    if not 'title' in props:
+    if 'title' not in props:
         props['title'] = soup.title.string
 
     return props
@@ -857,7 +854,7 @@ async def embed_formatting(message: Message) -> str:
             url_entity = entities[0]
             url = url_entity.get_text(note) if url_entity['type'] == "url" else url_entity['url']
             formatted_note += await get_url_info_formatting(url)
-    except Exception as e:
+    except Exception:
         # If the message does not contain any formatting
         # await message.reply(f'🤷‍♂️ {e}')
         formatted_note = note
@@ -883,7 +880,7 @@ async def embed_formatting_caption(message: Message) -> str:
             url_entity = entities[0]
             url = url_entity.get_text(note) if url_entity['type'] == "url" else url_entity['url']
             formatted_note += await get_url_info_formatting(url)
-    except Exception as e:
+    except Exception:
         # If the message does not contain any formatting
         # await message.reply(f'🤷‍♂️ {e}')
         formatted_note = note
@@ -1099,7 +1096,8 @@ def text_to_chunks(text, max_len):
             # This sentence fits into the current chunk, add it
             chunk += ' ' + sentence
     # Save the last chunk, if it is not empty
-    if len(chunk) > 0: texts.append(chunk.strip(' '))
+    if len(chunk) > 0:
+        texts.append(chunk.strip(' '))
     return texts
 
 def get_location_note(message: Message) -> str:
