@@ -193,28 +193,6 @@ def should_add_timestamp(message: Message) -> bool:
     
     return time_diff >= config.message_timestamp_interval
 
-def should_add_timestamp(message: Message) -> bool:
-    """
-    Check if we should add timestamp for the message based on time difference with previous message.
-    
-    Args:
-        message (Message): Current message
-        
-    Returns:
-        bool: True if timestamp should be added, False otherwise
-    """
-    chat_id = message.chat.id
-    current_time = message.date
-    
-    if chat_id not in last_message_times:
-        last_message_times[chat_id] = current_time
-        return True
-        
-    time_diff = (current_time - last_message_times[chat_id]).total_seconds()
-    last_message_times[chat_id] = current_time
-    
-    return time_diff >= config.message_timestamp_interval
-
 # Handlers
 @dp.message(Command("start"))
 async def command_start(message: types.Message):
