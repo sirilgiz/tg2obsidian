@@ -20,10 +20,18 @@ create_link_info = True
 time_zone = 'Europe/Moscow'
 
 # If True, voice messages will be recognized to text.
-# This requires Whisper ( https://github.com/openai/whisper ), FFMPEG, Python and PyTorch to be installed
-# on the machine where the script is running.
 # If False, voice messages will not be recognized nor stored.
 recognize_voice = False
+
+# Speech-to-text provider: "local" (Whisper) or "cloud" (OpenAI-compatible API).
+stt_provider = "local"
+
+# Cloud STT settings (OpenAI-compatible API)
+# Example base URL: https://api.openai.com/v1
+stt_base_url = "https://api.vsegpt.ru/v1"
+stt_api_key = "your_api_hey_here"
+stt_model_name = "stt-openai/whisper-v3-turbo"
+stt_language = "ru"
 
 # Whisper speech recognition software's model options and their relative speed and size of DB:
 # tiny (x32, 78MB), base(x16, 145MB), small(x6, 484MB), medium(x2, 1.5GB), large(x1, 3.1GB).

@@ -129,24 +129,52 @@ if config.ocr:
         ocr_languages = 'eng'
     print(f'Prepared for OCR in {ocr_languages}')
 
+stt_provider = str(getattr(config, 'stt_provider', 'local')).strip().lower()
+stt_client = None
+stt_model_name = ''
+stt_language = 'ru'
+
 if config.recognize_voice:
-    import torch
-    import whisper
-    import gc
+    if stt_provider == 'cloud':
+        try:
+            from openai import OpenAI, OpenAIError
+        except Exception:
+            OpenAI = None  # type: ignore
+            OpenAIError = Exception  # type: ignore
 
-    whisper_device = getattr(config, 'whisper_device', 'cpu')
+        stt_base_url = str(getattr(config, 'stt_base_url', '')).strip()
+        stt_api_key = str(getattr(config, 'stt_api_key', '')).strip()
+        stt_model_name = str(getattr(config, 'stt_model_name', '')).strip()
+        stt_language = str(getattr(config, 'stt_language', 'ru')).strip() or 'ru'
 
-    if whisper_device == 'cpu':
-        torch.cuda.is_available = lambda : False
+        stt_client = None
+        if OpenAI is not None and stt_api_key:
+            if stt_base_url:
+                stt_client = OpenAI(api_key=stt_api_key, base_url=stt_base_url)
+            else:
+                stt_client = OpenAI(api_key=stt_api_key)
 
-    model = whisper.load_model(config.whisper_model)
-
-    if whisper_device == 'cuda' and torch.cuda.is_available():
-        model = model.to('cuda')
+        whisper_device = 'cloud'
+        print('Prepared for speech-to-text recognition with cloud provider')
     else:
-        model = model.to('cpu')
+        import torch
+        import whisper
+        import gc
 
-    print(f'Prepared for speech-to-text recognition on {whisper_device}')
+        whisper_device = getattr(config, 'whisper_device', 'cpu')
+
+        if whisper_device == 'cpu':
+            torch.cuda.is_available = lambda : False
+
+        model = whisper.load_model(config.whisper_model)
+
+        if whisper_device == 'cuda' and torch.cuda.is_available():
+            model = model.to('cuda')
+        else:
+            model = model.to('cpu')
+
+        stt_language = str(getattr(config, 'stt_language', 'ru')).strip() or 'ru'
+        print(f'Prepared for speech-to-text recognition on {whisper_device}')
 
 def should_add_timestamp(message: Message) -> bool:
     """
@@ -607,7 +635,7 @@ def _task_suffix_forced() -> str:
     now_local = dt.now(timezone(config.time_zone))
     today = now_local.strftime('%Y-%m-%d')
     tomorrow = (now_local + timedelta(days=1)).strftime('%Y-%m-%d')
-    return f' ➕ {today} 📅 {tomorrow}'
+    return f' 🔺 ➕ {today} 📅 {tomorrow}'
 
 def check_if_task(note_body: str, force_task: bool = False) -> str:
     """
@@ -883,7 +911,39 @@ async def recognize_text_from_image(image_path: str, ocr_languages: str) -> str:
 async def stt(audio_file_path) -> str:
     log_basic(f'Starting audio recognition on {whisper_device}')
 
-    result = model.transcribe(audio_file_path, verbose=False, language='ru')
+    if stt_provider == 'cloud':
+        if stt_client is None or not stt_model_name:
+            log_basic('Cloud STT is not configured')
+            return ''
+        try:
+            with open(audio_file_path, 'rb') as audio_file:
+                transcript = stt_client.audio.transcriptions.create(
+                    model=stt_model_name,
+                    response_format='json',
+                    language=stt_language,
+                    file=audio_file,
+                )
+            transcript_text = str(getattr(transcript, 'text', '') or '').strip()
+            if len(transcript_text) < 2:
+                log_basic('Nothing recognized')
+                return ''
+
+            alltext = re.sub(r"([\.\!\?]) ", "\\1\n", transcript_text)
+            if debug_log:
+                log_debug(f'Recognized: {alltext}')
+            else:
+                log_basic(f'Recognized {len(alltext)} characters')
+            return alltext
+        except OpenAIError as e:
+            log_basic(f'Error during cloud STT: {e}')
+            return ''
+        except Exception as e:
+            log_basic(f'Error during cloud STT: {e}')
+            return ''
+
+    log_basic(f'Starting audio recognition on {whisper_device}')
+
+    result = model.transcribe(audio_file_path, verbose=False, language=stt_language)
 
     if whisper_device == 'cuda' and torch.cuda.is_available():
         # Clear GPU memory
