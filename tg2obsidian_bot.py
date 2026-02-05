@@ -10,26 +10,31 @@ import aiohttp
 import time
 import asyncio
 import aiofiles
+import warnings
 
 from pathlib import Path
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta
 from bs4 import BeautifulSoup
 from pytz import timezone
-import urllib.request
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
-from aiogram.filters import Filter, Command
-from aiogram.types import ContentType, File, Message, MessageEntity, Poll, PollAnswer
-from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
+from aiogram.filters import Command
+from aiogram.types import File, Message, MessageEntity
 from aiogram.enums import ParseMode
-from aiogram.methods.set_message_reaction import SetMessageReaction
 from aiogram.utils.text_decorations import html_decoration
-from database import set_notes_folder, get_notes_folder
+from database import set_notes_folder, get_notes_folder, get_all_as_tasks, set_all_as_tasks
+from aiogram.client.default import DefaultBotProperties
 
 import config
 allowed_chats = [int(x) for x in config.allowed_chats.split(':')]
 
+# Для группировки отправленных вместе сообщений
+last_message_times = {}
+
 # TODO: assign values of config variables to local variables using the form `my_chat_id = getattr(config, "my_chat_id", 123456789)` and change all references to these variables accordingly
+
+# Игнорируем предупреждение о FP16 на CPU
+warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
 
 class CommonMiddleware(BaseMiddleware):
 
@@ -47,6 +52,11 @@ class CommonMiddleware(BaseMiddleware):
 
             notes_folder = get_notes_folder(message.chat.id)
             note = note_from_message(message, notes_folder)
+            # read forced task flag for this chat
+            try:
+                note.all_as_tasks = get_all_as_tasks(message.chat.id)
+            except Exception:
+                note.all_as_tasks = False
             data["note"] = note
         try:
             result = await handler(event, data)
@@ -62,23 +72,38 @@ class CommonMiddleware(BaseMiddleware):
             await answer_message(message, f'🤷‍♂️ {e}')
             return
 
-bot = Bot(token = config.token, parse_mode=ParseMode.HTML)
+bot = Bot(token=config.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 # router = Router()
 dp = Dispatcher()
 dp.update.middleware(CommonMiddleware())  # Регистрация middleware
 
+async def _set_bot_commands(bot: Bot) -> None:
+    """Register bot commands in Telegram UI on startup."""
+    commands = [
+        types.BotCommand(command="start", description="Start bot"),
+        types.BotCommand(command="help", description="Show help"),
+        types.BotCommand(command="set_folder", description="Set custom notes folder"),
+        types.BotCommand(command="tasks", description="Force all posts as tasks (on/off)"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+async def _on_startup(bot: Bot) -> None:
+    await _set_bot_commands(bot)
+
+
+dp.startup.register(_on_startup)
+
 
 class Note:
-    def __init__(self,
-                 text = "",
-                 date = dt.now().strftime('%Y-%m-%d'),
-                 time = dt.now().strftime('%H:%M:%S'),
-                 notes_folder = None
-                 ) -> None:
-        self.text = text
+    """Class to represent a note with its metadata"""
+    def __init__(self, date: str, time: str, notes_folder: str, message: Message | None = None, all_as_tasks: bool = False):
         self.date = date
         self.time = time
         self.notes_folder = notes_folder
+        self.message = message
+        self.text = ""
+        self.all_as_tasks = all_as_tasks
 
 basic_log = False
 debug_log = False
@@ -100,24 +125,73 @@ if config.ocr:
         ocr_languages = 'eng'
     print(f'Prepared for OCR in {ocr_languages}')
 
+stt_provider = str(getattr(config, 'stt_provider', 'local')).strip().lower()
+stt_client = None
+stt_model_name = ''
+stt_language = 'ru'
+
 if config.recognize_voice:
-    import torch
-    import whisper
-    import gc
+    if stt_provider == 'cloud':
+        try:
+            from openai import OpenAI, OpenAIError
+        except Exception:
+            OpenAI = None  # type: ignore
+            OpenAIError = Exception  # type: ignore
 
-    whisper_device = getattr(config, 'whisper_device', 'cpu')
+        stt_base_url = str(getattr(config, 'stt_base_url', '')).strip()
+        stt_api_key = str(getattr(config, 'stt_api_key', '')).strip()
+        stt_model_name = str(getattr(config, 'stt_model_name', '')).strip()
+        stt_language = str(getattr(config, 'stt_language', 'ru')).strip() or 'ru'
 
-    if whisper_device == 'cpu':
-        torch.cuda.is_available = lambda : False
+        stt_client = None
+        if OpenAI is not None and stt_api_key:
+            if stt_base_url:
+                stt_client = OpenAI(api_key=stt_api_key, base_url=stt_base_url)
+            else:
+                stt_client = OpenAI(api_key=stt_api_key)
 
-    model = whisper.load_model(config.whisper_model)
-
-    if whisper_device == 'cuda' and torch.cuda.is_available():
-        model = model.to('cuda')
+        whisper_device = 'cloud'
+        print('Prepared for speech-to-text recognition with cloud provider')
     else:
-        model = model.to('cpu')
+        import torch
+        import whisper
 
-    print(f'Prepared for speech-to-text recognition on {whisper_device}')
+        whisper_device = getattr(config, 'whisper_device', 'cpu')
+
+        if whisper_device == 'cpu':
+            torch.cuda.is_available = lambda : False
+
+        model = whisper.load_model(config.whisper_model)
+
+        if whisper_device == 'cuda' and torch.cuda.is_available():
+            model = model.to('cuda')
+        else:
+            model = model.to('cpu')
+
+        stt_language = str(getattr(config, 'stt_language', 'ru')).strip() or 'ru'
+        print(f'Prepared for speech-to-text recognition on {whisper_device}')
+
+def should_add_timestamp(message: Message) -> bool:
+    """
+    Check if we should add timestamp for the message based on time difference with previous message.
+    
+    Args:
+        message (Message): Current message
+        
+    Returns:
+        bool: True if timestamp should be added, False otherwise
+    """
+    chat_id = message.chat.id
+    current_time = message.date
+    
+    if chat_id not in last_message_times:
+        last_message_times[chat_id] = current_time
+        return True
+        
+    time_diff = (current_time - last_message_times[chat_id]).total_seconds()
+    last_message_times[chat_id] = current_time
+    
+    return time_diff >= config.message_timestamp_interval
 
 # Handlers
 @dp.message(Command("start"))
@@ -159,6 +233,18 @@ Your current notes folder: <code>{current_notes_folder}</code>
     result = set_notes_folder(message.chat.id, relative_folder_path)
     await answer_message(message, result)
 
+@dp.message(Command("tasks"))
+async def command_tasks(message: types.Message, note: Note):
+    """Toggle forced task mode for this chat: /tasks on|off"""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        state = "ON" if get_all_as_tasks(message.chat.id) else "OFF"
+        await answer_message(message, f"All posts as tasks is currently <b>{state}</b>.\nUsage: <code>/tasks on</code> or <code>/tasks off</code>")
+        return
+    enabled = args[1].lower() == "on"
+    result = set_all_as_tasks(message.chat.id, enabled)
+    await answer_message(message, result)
+
 @dp.message(Command("help"))
 async def command_help(message: types.Message, note: Note):
     reply_text = '''
@@ -167,6 +253,7 @@ async def command_help(message: types.Message, note: Note):
 /set_folder - set or reset custom relative folder for saving notes
     usage: <code>/set_folder path/to/folder</code>
     <code>/set_folder</code> without path resets custom folder to the default
+ /tasks on|off - add all posts to vault as tasks for this chat
 text, media, picture message of other kinds of messages - to be passed into Obsidian inbox. Text may be added according to text recognition settings in config
 '''
     await answer_message(message, reply_text)
@@ -175,7 +262,7 @@ text, media, picture message of other kinds of messages - to be passed into Obsi
 async def handle_voice_message(message: Message, note: Note):
     log_basic(f'Received voice message from @{message.from_user.username}')
     if not config.recognize_voice:
-        log_basic(f'Voice recognition is turned OFF')
+        log_basic('Voice recognition is turned OFF')
         return
 
     path = os.path.dirname(__file__)
@@ -202,7 +289,7 @@ async def handle_voice_message(message: Message, note: Note):
 async def handle_audio(message: Message, note: Note):
     log_basic(f'Received audio file from @{message.from_user.username}')
     if not config.recognize_voice:
-        log_basic(f'Voice recognition is turned OFF')
+        log_basic('Voice recognition is turned OFF')
         return
 
     try:
@@ -223,7 +310,7 @@ async def handle_audio(message: Message, note: Note):
     except Exception as e:
         await answer_message(message, f'🤷‍♂️ {e}')
     # Add label, if any, and a file name
-    if message.caption != None:
+    if message.caption is not None:
         file_details = f'{bold(message.caption)} ({message.audio.file_name})'
     else:
         file_details = bold(message.audio.file_name)
@@ -278,7 +365,7 @@ async def handle_document(message: Message, note: Note):
         return
 
     if config.recognize_voice and message.document.mime_type.split('/')[0] == 'audio':
-    # if mime type = "audio/*", recognize it like ContentType.AUDIO
+        # if mime type = "audio/*", recognize it like ContentType.AUDIO
         await bot.send_chat_action(chat_id=message.from_user.id, action=types.ChatActions.TYPING)
 
         file_full_path = os.path.join(config.photo_path, file_name)
@@ -288,7 +375,7 @@ async def handle_document(message: Message, note: Note):
         except Exception as e:
             await answer_message(message, f'🤷‍♂️ {e}')
         # Add label, if any, and a file name
-        if message.caption != None:
+        if message.caption is not None:
             file_details = f'{bold(message.caption)} ({file_name})'
         else:
             file_details = bold(file_name)
@@ -317,14 +404,14 @@ async def handle_document(message: Message, note: Note):
 async def handle_contact(message: Message, note: Note):
     log_basic(f'Received contact from @{message.from_user.username}')
 
-    print(f'Got contact')
+    print('Got contact')
     note.text = await get_contact_data(message)
     save_message(note)
 
 @dp.message(F.location)
 async def handle_location(message: Message, note: Note):
     log_basic(f'Received location from @{message.from_user.username}')
-    print(f'Got location')
+    print('Got location')
 
     note.text = get_location_note(message)
     save_message(note)
@@ -504,7 +591,7 @@ def get_curr_date() -> str:
 
 
 def one_line_note() -> bool:
-    one_line_note = False if 'one_line_note' not in dir(config) or config.one_line_note == False else True
+    one_line_note = False if 'one_line_note' not in dir(config) or not config.one_line_note else True
     return one_line_note
 
 
@@ -514,6 +601,7 @@ def format_messages() -> bool:
 
 def create_link_info() -> bool:
     return False if 'create_link_info' not in dir(config) else config.create_link_info
+
 
 def save_message(note: Note) -> None:
     curr_date = note.date
@@ -525,26 +613,63 @@ def save_message(note: Note) -> None:
     if one_line_note():
         # Replace all line breaks with spaces and make simple time stamp
         note_body = note.text.replace('\n', ' ')
-        note_text = check_if_task(check_if_negative(f'[[{curr_date}]] - {note_body}\n'))
+        note_text = check_if_task(check_if_negative(f'[[{curr_date}]] - {note_body}\n'), getattr(note, 'all_as_tasks', False))
     else:
         # Keep line breaks and add a header with a time stamp
-        note_body = check_if_task(check_if_negative(note.text))
-        note_text = f'#### [[{curr_date}]] {curr_time}\n{note_body}\n\n'
+        note_body = check_if_task(check_if_negative(note.text), getattr(note, 'all_as_tasks', False))
+        if hasattr(note, 'message') and not should_add_timestamp(note.message):
+            note_text = f'{note_body}\n\n'
+        else:
+            note_text = f'#### [[{curr_date}]] {curr_time}\n{note_body}\n\n'
+
     with open(get_note_name(curr_date, folder_path), 'a', encoding='UTF-8') as f:
         f.write(note_text)
 
-def check_if_task(note_body) -> str:
+def _task_suffix_forced() -> str:
+    """Build the suffix to append to a forced task: ' ➕ today 📅 tomorrow'"""
+    now_local = dt.now(timezone(config.time_zone))
+    today = now_local.strftime('%Y-%m-%d')
+    tomorrow = (now_local + timedelta(days=1)).strftime('%Y-%m-%d')
+    return f' 🔺 ➕ {today} 📅 {tomorrow}'
+
+def check_if_task(note_body: str, force_task: bool = False) -> str:
+    """
+    Add task marker to note body when needed.
+    - If force_task=True: make only the first line a task (if not already), append suffix, leave the rest as-is.
+    - Else: legacy keyword-based detection; do not duplicate checkbox if already present.
+    """
+    checkbox_re = r'^\s*-\s*\[\s*[xX ]\s*\]\s'
+
+    if force_task:
+        lines = note_body.split('\n') if note_body else ['']
+        first = lines[0] if lines else ''
+        if not re.match(checkbox_re, first):
+            first = f'- [ ] {first}{_task_suffix_forced()}'
+        else:
+            # already a task; ensure suffix appended once
+            if _task_suffix_forced() not in first:
+                first = f'{first}{_task_suffix_forced()}'
+        if len(lines) > 1:
+            return '\n'.join([first] + lines[1:])
+        return first
+
+    # keyword-based detection
     is_task = False
     for keyword in config.task_keywords:
-        if keyword.lower() in note_body.lower(): is_task = True
-    if is_task: note_body = '- [ ] ' + note_body
+        if keyword.lower() in note_body.lower():
+            is_task = True
+            break
+    if is_task and not re.match(checkbox_re, note_body):
+        note_body = '- [ ] ' + note_body
     return note_body
 
 def check_if_negative(note_body) -> str:
     is_negative = False
     for keyword in config.negative_keywords:
-        if keyword.lower() in note_body.lower(): is_negative = True
-    if is_negative: note_body += f'\n{config.negative_tag}'
+        if keyword.lower() in note_body.lower():
+            is_negative = True
+    if is_negative:
+        note_body += f'\n{config.negative_tag}'
     return note_body
 
 # returns index of a first non ws character in a string
@@ -670,11 +795,11 @@ def get_open_graph_props(page: str) -> dict:
     meta = soup.find_all("meta", property=lambda x: x is not None and x.startswith("og:"))
     for m in meta:
         props[m['property'][3:].lstrip()] = m['content']
-    if not 'description' in props:
+    if 'description' not in props:
         m = soup.find("meta", attrs={"name": "description"})
         if m:
             props['description'] = m['content']
-    if not 'title' in props:
+    if 'title' not in props:
         props['title'] = soup.title.string
 
     return props
@@ -729,7 +854,7 @@ async def embed_formatting(message: Message) -> str:
             url_entity = entities[0]
             url = url_entity.get_text(note) if url_entity['type'] == "url" else url_entity['url']
             formatted_note += await get_url_info_formatting(url)
-    except Exception as e:
+    except Exception:
         # If the message does not contain any formatting
         # await message.reply(f'🤷‍♂️ {e}')
         formatted_note = note
@@ -755,7 +880,7 @@ async def embed_formatting_caption(message: Message) -> str:
             url_entity = entities[0]
             url = url_entity.get_text(note) if url_entity['type'] == "url" else url_entity['url']
             formatted_note += await get_url_info_formatting(url)
-    except Exception as e:
+    except Exception:
         # If the message does not contain any formatting
         # await message.reply(f'🤷‍♂️ {e}')
         formatted_note = note
@@ -783,7 +908,39 @@ async def recognize_text_from_image(image_path: str, ocr_languages: str) -> str:
 async def stt(audio_file_path) -> str:
     log_basic(f'Starting audio recognition on {whisper_device}')
 
-    result = model.transcribe(audio_file_path, verbose=False, language='ru')
+    if stt_provider == 'cloud':
+        if stt_client is None or not stt_model_name:
+            log_basic('Cloud STT is not configured')
+            return ''
+        try:
+            with open(audio_file_path, 'rb') as audio_file:
+                transcript = stt_client.audio.transcriptions.create(
+                    model=stt_model_name,
+                    response_format='json',
+                    language=stt_language,
+                    file=audio_file,
+                )
+            transcript_text = str(getattr(transcript, 'text', '') or '').strip()
+            if len(transcript_text) < 2:
+                log_basic('Nothing recognized')
+                return ''
+
+            alltext = re.sub(r"([\.\!\?]) ", "\\1\n", transcript_text)
+            if debug_log:
+                log_debug(f'Recognized: {alltext}')
+            else:
+                log_basic(f'Recognized {len(alltext)} characters')
+            return alltext
+        except OpenAIError as e:
+            log_basic(f'Error during cloud STT: {e}')
+            return ''
+        except Exception as e:
+            log_basic(f'Error during cloud STT: {e}')
+            return ''
+
+    log_basic(f'Starting audio recognition on {whisper_device}')
+
+    result = model.transcribe(audio_file_path, verbose=False, language=stt_language)
 
     if whisper_device == 'cuda' and torch.cuda.is_available():
         # Clear GPU memory
@@ -939,7 +1096,8 @@ def text_to_chunks(text, max_len):
             # This sentence fits into the current chunk, add it
             chunk += ' ' + sentence
     # Save the last chunk, if it is not empty
-    if len(chunk) > 0: texts.append(chunk.strip(' '))
+    if len(chunk) > 0:
+        texts.append(chunk.strip(' '))
     return texts
 
 def get_location_note(message: Message) -> str:
@@ -969,13 +1127,22 @@ def bold(text: str) -> str:
         return text
 
 
-def note_from_message(message: Message, notes_folder: str):
+def note_from_message(message: Message, notes_folder: str) -> Note:
+    """
+    Create Note object from Telegram message
+    
+    Args:
+        message (Message): Telegram message
+        notes_folder (str): Folder path for saving notes
+        
+    Returns:
+        Note: Note object with message metadata
+    """
     local_tz = timezone(config.time_zone)
     message_date = message.date.astimezone(local_tz)
     msg_date = message_date.strftime('%Y-%m-%d')
     msg_time = message_date.strftime('%H:%M:%S')
-    note = Note(date=msg_date, time=msg_time, notes_folder=notes_folder)
-    return note
+    return Note(date=msg_date, time=msg_time, notes_folder=notes_folder, message=message)
 
 
 async def main() -> None:
